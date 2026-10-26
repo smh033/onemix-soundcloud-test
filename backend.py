@@ -91,7 +91,7 @@ class Login(BaseModel):
 def health():
     return {"ok": True, "source": "soundcloud-yt-dlp-original-download-only",
             "configured": configured(), "status": STATE["status"],
-            "testTrackConfigured": bool(TEST_URL), "rightsConfirmed": RIGHTS_CONFIRMED}
+            "testTrackConfigured": bool(TEST_URL), "rightsConfirmed": RIGHTS_CONFIRMED, "formatInspectionEnabled": True}
 
 
 @app.get("/")
@@ -117,7 +117,9 @@ a{color:#b4e8f5}audio{width:100%;margin-top:12px}
 <section><label for="secret">Your Render AUDIO_IMPORT_SECRET</label><input id="secret" type="password" autocomplete="off" placeholder="Paste your existing secret">
 <button id="login">Unlock test</button><p id="loginMessage"></p></section>
 <section><h2>Audio test</h2><p>No Spotify, YouTube or stream-only fallback. Render uses yt-dlp's <code>download</code> format only.</p>
+<button id="inspect" disabled style="background:#29445b;color:#edf8ff;margin-right:8px">Inspect available formats</button>
 <button id="run" disabled>Start authorized download test</button>
+<p style="font-size:13px">First choose Inspect available formats. This does not download audio and reports whether SoundCloud exposes an original download to Render.</p>
 <pre id="out">Sign in to begin.</pre><audio id="audio" controls preload="none" style="display:none"></audio></section>
 <p>Only use a SoundCloud track whose original file the creator offers for download and for which you have permission to store and play it here. A 429 still means SoundCloud is rate-limiting Render.</p>
 </main><script>
@@ -128,8 +130,11 @@ async function poll(){try{const j=await call('/status');out.textContent=JSON.str
 if(j.status==='ready'){$('audio').style.display='block';$('audio').src='/audio';$('audio').load();clearInterval(pollTimer);pollTimer=null;}
 if(j.status==='failed'){clearInterval(pollTimer);pollTimer=null;$('run').disabled=false;}
 }catch(e){out.textContent=String(e);clearInterval(pollTimer);pollTimer=null;}}
-$('login').onclick=async()=>{try{await call('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:$('secret').value})});$('secret').value='';$('loginMessage').textContent='Unlocked. You can run the test.';$('run').disabled=false;await poll();}
+$('login').onclick=async()=>{try{await call('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:$('secret').value})});$('secret').value='';$('loginMessage').textContent='Unlocked. Inspect formats first.';$('run').disabled=false;$('inspect').disabled=false;await poll();}
 catch(e){$('loginMessage').textContent=String(e)}};
+$('inspect').onclick=async()=>{$('inspect').disabled=true;out.textContent='Inspecting formats (no download)...';
+try{const j=await call('/inspect',{method:'POST'});out.textContent=JSON.stringify(j,null,2)}
+catch(e){out.textContent=String(e)}finally{$('inspect').disabled=false}};
 $('run').onclick=async()=>{$('run').disabled=true;$('audio').pause();$('audio').style.display='none';
 try{await call('/start',{method:'POST'});await poll();if(!pollTimer)pollTimer=setInterval(poll,2000)}catch(e){out.textContent=String(e);$('run').disabled=false}};
 </script></body></html>""")
@@ -149,7 +154,7 @@ def login(payload: Login):
 
 
 @app.get("/status")
-def get_status(onemix_sc_test: str | None = Cookie(default=None)):
+def get_status(onemix_sc_test: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     require_auth(onemix_sc_test)
     return {**STATE, "readyToPlay": bool(STATE["status"] == "ready" and AUDIO_PATH and AUDIO_PATH.exists())}
 
@@ -210,11 +215,89 @@ async def run_test():
         kind = type(exc).__name__
         message = str(exc)[:450]
         STATE.update({"status": "failed", "errorType": kind, "error": message})
+        if "Requested format is not available" in message:
+            message += " — Original 'download' format was not exposed; use /test > Inspect available formats to diagnose." 
+            STATE["error"] = message[:600]
         print(f"SoundCloud test failed: {kind}: {message}", flush=True)
 
 
+class _InspectLogger:
+    """Capture only harmless extractor diagnostics, never private media URLs."""
+    def __init__(self):
+        self.warnings = []
+
+    def debug(self, message):
+        pass
+
+    def warning(self, message):
+        if len(self.warnings) < 6:
+            # Avoid leaking signed URLs or authentication material in diagnostics.
+            msg = re.sub(r"https?://\S+", "[link omitted]", str(message))
+            self.warnings.append(msg[:220])
+
+    def error(self, message):
+        self.warning(message)
+
+
+def inspect_formats():
+    """Check metadata only. Never download a recording or print signed media URLs."""
+    logger = _InspectLogger()
+    opts = {
+        "skip_download": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": False,
+        "logger": logger,
+        "socket_timeout": 15,
+        "retries": 0,
+        "fragment_retries": 0,
+        "extractor_retries": 0,
+    }
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(TEST_URL, download=False)
+        if not isinstance(info, dict):
+            return {"ok": False, "error": "Extractor returned no track metadata", "warnings": logger.warnings}
+        formats = info.get("formats") or []
+        original = any(f.get("format_id") == "download" for f in formats)
+        safe_formats = [
+            {"id": str(f.get("format_id", ""))[:60], "ext": str(f.get("ext", ""))[:16],
+             "note": str(f.get("format_note") or "")[:55]}
+            for f in formats[:18]
+        ]
+        needs_login = any("registered users" in warning.lower() or "login" in warning.lower()
+                          for warning in logger.warnings)
+        return {
+            "ok": True,
+            "title": str(info.get("title") or "Unknown")[:160],
+            "uploader": str(info.get("uploader") or "Unknown")[:160],
+            "originalDownloadAvailable": original,
+            "possibleSignInRequired": needs_login,
+            "formats": safe_formats,
+            "warnings": logger.warnings,
+            "diagnosis": ("Original downloadable file is available to this backend."
+                          if original else
+                          "Original download not available without sign-in." if needs_login else
+                          "Only streaming formats are visible (or no formats were exposed). "
+                          "This test will not copy streams."),
+        }
+    except Exception as exc:
+        error = re.sub(r"https?://\S+", "[link omitted]", str(exc))
+        return {"ok": False, "errorType": type(exc).__name__,
+                "error": error[:350], "warnings": logger.warnings,
+                "diagnosis": "Could not inspect formats; check Render logs or retry later if rate-limited."}
+
+
+@app.post("/inspect")
+async def inspect(onemix_sc_test: str | None = Cookie(default=None, alias=COOKIE_NAME)):
+    require_auth(onemix_sc_test)
+    if not configured():
+        raise HTTPException(503, "Test service is not configured")
+    return await asyncio.to_thread(inspect_formats)
+
+
 @app.post("/start", status_code=202)
-async def start(onemix_sc_test: str | None = Cookie(default=None)):
+async def start(onemix_sc_test: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     global ACTIVE_TASK
     require_auth(onemix_sc_test)
     if not configured():
@@ -231,7 +314,7 @@ async def start(onemix_sc_test: str | None = Cookie(default=None)):
 
 
 @app.get("/audio")
-def audio(onemix_sc_test: str | None = Cookie(default=None)):
+def audio(onemix_sc_test: str | None = Cookie(default=None, alias=COOKIE_NAME)):
     require_auth(onemix_sc_test)
     if STATE["status"] != "ready" or not AUDIO_PATH or not AUDIO_PATH.exists():
         raise HTTPException(404, "No audio test file is ready")
